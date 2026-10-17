@@ -1,0 +1,8 @@
+flask
+flask-cors
+pandas
+openpyxl
+prophet
+numpy
+xgboost
+scikit-learn
