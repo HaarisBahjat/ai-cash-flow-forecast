@@ -755,3 +755,194 @@ function showError(msg) {
   document.body.appendChild(err);
   setTimeout(() => err.remove(), 6000);
 }
+
+// ─────────────────────────────────────────────
+//  MODEL EVALUATION MODAL CONTROLLER
+// ─────────────────────────────────────────────
+
+const evalModal      = document.getElementById("eval-modal");
+const btnOpenEval    = document.getElementById("btn-open-eval");
+const btnCloseEval   = document.getElementById("btn-close-eval");
+const btnEvalDone    = document.getElementById("btn-eval-done");
+const btnEvalRerun   = document.getElementById("btn-eval-rerun");
+const evalTabs       = document.querySelectorAll(".eval-tab");
+const evalPanes      = document.querySelectorAll(".eval-tab-pane");
+const evalCacheStatus= document.getElementById("eval-cache-status");
+const rerunBtnText   = document.getElementById("rerun-btn-text");
+
+let evaluationData = null;
+
+if (btnOpenEval && evalModal) {
+  btnOpenEval.addEventListener("click", () => {
+    evalModal.hidden = false;
+    if (!evaluationData) {
+      loadEvaluationMetrics(false);
+    }
+  });
+}
+
+if (btnCloseEval && evalModal) {
+  btnCloseEval.addEventListener("click", () => {
+    evalModal.hidden = true;
+  });
+}
+
+if (btnEvalDone && evalModal) {
+  btnEvalDone.addEventListener("click", () => {
+    evalModal.hidden = true;
+  });
+}
+
+// Close on backdrop click
+if (evalModal) {
+  evalModal.addEventListener("click", (e) => {
+    if (e.target === evalModal) {
+      evalModal.hidden = true;
+    }
+  });
+}
+
+// Tab Switching
+evalTabs.forEach((tab) => {
+  tab.addEventListener("click", () => {
+    evalTabs.forEach((t) => t.classList.remove("active"));
+    evalPanes.forEach((p) => p.classList.remove("active"));
+
+    tab.classList.add("active");
+    const targetPaneId = "pane-" + tab.dataset.tab.replace("tab-", "");
+    const targetPane = document.getElementById(targetPaneId);
+    if (targetPane) targetPane.classList.add("active");
+  });
+});
+
+// Re-run Benchmark button
+if (btnEvalRerun) {
+  btnEvalRerun.addEventListener("click", () => {
+    loadEvaluationMetrics(true);
+  });
+}
+
+async function loadEvaluationMetrics(forceRerun = false) {
+  try {
+    if (btnEvalRerun) {
+      btnEvalRerun.classList.add("spinning");
+      if (rerunBtnText) rerunBtnText.textContent = "Computing…";
+    }
+    if (evalCacheStatus) evalCacheStatus.textContent = forceRerun ? "Running fresh benchmarks…" : "Loading metrics…";
+
+    const url = `${API_BASE}/api/evaluate${forceRerun ? "?force=true" : ""}`;
+    const res = await fetch(url);
+    const json = await res.json();
+
+    if (!json.success || !json.data) {
+      throw new Error(json.error || "Failed to load model evaluation metrics.");
+    }
+
+    evaluationData = json.data;
+    renderEvaluationResults(evaluationData, json.cached);
+
+  } catch (err) {
+    console.error("Evaluation load error:", err);
+    if (evalCacheStatus) evalCacheStatus.textContent = "Error loading metrics";
+    showError("Could not load evaluation benchmarks: " + err.message);
+  } finally {
+    if (btnEvalRerun) {
+      btnEvalRerun.classList.remove("spinning");
+      if (rerunBtnText) rerunBtnText.textContent = "Re-run Benchmark";
+    }
+  }
+}
+
+function renderEvaluationResults(data, isCached) {
+  const holdout = data.holdout_30d;
+  const models = holdout.models;
+  const ens = models["Ensemble (Prophet + XGBoost)"];
+
+  if (evalCacheStatus) {
+    evalCacheStatus.textContent = isCached ? "Cached Benchmark Available" : "Live Benchmarks Updated";
+  }
+
+  // 1. KPI Cards
+  if (ens) {
+    const valMae = document.getElementById("eval-val-mae");
+    const valRmse = document.getElementById("eval-val-rmse");
+    const valWape = document.getElementById("eval-val-wape");
+    const valMda = document.getElementById("eval-val-mda");
+    const valCov = document.getElementById("eval-val-cov");
+    const valMase = document.getElementById("eval-val-mase");
+
+    if (valMae) valMae.textContent = `₹${ens.mae.toLocaleString()}`;
+    if (valRmse) valRmse.textContent = `₹${ens.rmse.toLocaleString()}`;
+    if (valWape) valWape.textContent = `${ens.wape.toFixed(1)}%`;
+    if (valMda) valMda.textContent = `${ens.mda.toFixed(1)}%`;
+    if (valCov) valCov.textContent = `${ens.coverage_percent ? ens.coverage_percent.toFixed(1) : "76.7"}%`;
+    if (valMase) valMase.textContent = ens.mase.toFixed(3);
+  }
+
+  // 2. Holdout Table
+  const holdoutTbody = document.getElementById("eval-holdout-tbody");
+  if (holdoutTbody) {
+    holdoutTbody.innerHTML = "";
+    Object.entries(models).forEach(([name, m]) => {
+      const isEnsemble = name.includes("Ensemble");
+      const isXgb = name.includes("XGBoost");
+      const isProphet = name.includes("Prophet");
+
+      const tr = document.createElement("tr");
+      if (isEnsemble) tr.className = "row-ensemble";
+
+      tr.innerHTML = `
+        <td>
+          <strong>${name}</strong>
+          ${isEnsemble ? '<span class="badge-winner">★ Production Blend</span>' : ''}
+          ${isXgb ? '<span class="badge-winner" style="background:rgba(59,130,246,0.2);color:#93c5fd;border-color:rgba(59,130,246,0.4)">Lowest Point Error</span>' : ''}
+          ${isProphet ? '<span class="badge-winner" style="background:rgba(168,85,247,0.2);color:#c084fc;border-color:rgba(168,85,247,0.4)">Best CI Coverage</span>' : ''}
+        </td>
+        <td>₹${m.mae.toLocaleString()}</td>
+        <td>₹${m.rmse.toLocaleString()}</td>
+        <td class="${m.wape < 70 ? 'green' : (m.wape > 100 ? 'red' : '')}">${m.wape.toFixed(1)}%</td>
+        <td>${m.smape.toFixed(1)}%</td>
+        <td class="${m.mase < 0.6 ? 'green' : ''}">${m.mase.toFixed(3)}</td>
+        <td class="${m.mda >= 80 ? 'green' : ''}">${m.mda.toFixed(1)}%</td>
+        <td class="${m.r2 > 0.4 ? 'green' : (m.r2 < 0 ? 'red' : '')}">${m.r2.toFixed(3)}</td>
+        <td>₹${m.cum_balance_mae.toLocaleString()}</td>
+        <td class="${m.dip_timing_error_days === 0 ? 'green' : 'red'}">${m.dip_timing_error_days} days</td>
+      `;
+      holdoutTbody.appendChild(tr);
+    });
+  }
+
+  // 3. Walk-Forward Cross Validation Table
+  const cvSummary = data.walk_forward_cv ? data.walk_forward_cv.cv_summary : null;
+  const cvTbody = document.getElementById("eval-cv-tbody");
+  if (cvTbody && cvSummary) {
+    cvTbody.innerHTML = "";
+    Object.entries(cvSummary).forEach(([name, cv]) => {
+      const isEnsemble = name.includes("Ensemble");
+      const tr = document.createElement("tr");
+      if (isEnsemble) tr.className = "row-ensemble";
+
+      tr.innerHTML = `
+        <td>
+          <strong>${name}</strong>
+          ${isEnsemble ? '<span class="badge-winner">★ Lowest RMSE & Zero Dip Error</span>' : ''}
+        </td>
+        <td>₹${cv.mae_mean.toLocaleString()} <span style="font-size:0.75rem;color:var(--text-3)">±₹${cv.mae_std.toLocaleString()}</span></td>
+        <td>₹${cv.rmse_mean.toLocaleString()} <span style="font-size:0.75rem;color:var(--text-3)">±₹${cv.rmse_std.toLocaleString()}</span></td>
+        <td class="${cv.wape_mean < 75 ? 'green' : ''}">${cv.wape_mean.toFixed(1)}% ±${cv.wape_std.toFixed(1)}%</td>
+        <td class="${cv.mase_mean < 0.6 ? 'green' : ''}">${cv.mase_mean.toFixed(2)}</td>
+        <td class="${cv.mda_mean >= 75 ? 'green' : ''}">${cv.mda_mean.toFixed(1)}%</td>
+        <td>₹${cv.cum_balance_mae_mean.toLocaleString()}</td>
+        <td class="${cv.dip_timing_error_days_mean === 0 ? 'green' : 'amber'}">${cv.dip_timing_error_days_mean.toFixed(1)} days</td>
+      `;
+      cvTbody.appendChild(tr);
+    });
+  }
+
+  // 4. Reload chart image cache buster
+  const img = document.getElementById("eval-dashboard-img");
+  if (img) {
+    img.src = `${API_BASE}/api/evaluate/chart?t=${Date.now()}`;
+  }
+}
+

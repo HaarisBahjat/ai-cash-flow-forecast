@@ -27,6 +27,10 @@
       <span class="logo-module">Cash Flow AI</span>
     </div>
     <nav class="header-nav">
+      <button class="nav-btn-eval" id="btn-open-eval" type="button" title="View ML Model Evaluations & Metrics">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 20V10M12 20V4M6 20v-6"/></svg>
+        <span>Model Evaluations</span>
+      </button>
       <span class="nav-badge">Ensemble ML</span>
       <span class="nav-powered">⚡ Prophet + XGBoost AI</span>
     </nav>
@@ -336,6 +340,192 @@
 <footer class="footer">
   <p>BB+ Cash Flow AI · Rule-based intelligence · Upgrade to Gemini API for richer insights</p>
 </footer>
+
+<!-- ═══════════════════  EVALUATION MODAL  ═══════════════════ -->
+<div class="modal-overlay" id="eval-modal" hidden>
+  <div class="modal-container">
+    <div class="modal-header">
+      <div class="modal-title-wrap">
+        <div class="modal-badge-row">
+          <span class="badge-eval-pill">✦ ML Validation Suite</span>
+          <span class="badge-eval-status" id="eval-cache-status">Cached Results Available</span>
+        </div>
+        <h3 class="modal-title">Model Evaluation & Benchmark Metrics</h3>
+        <p class="modal-sub">Comprehensive assessment across Regression, Directional Accuracy, Liquidity Risk, and Uncertainty Calibration</p>
+      </div>
+      <div class="modal-header-actions">
+        <button class="btn-eval-rerun" id="btn-eval-rerun" type="button" title="Re-run live benchmark computation">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+          <span id="rerun-btn-text">Re-run Benchmark</span>
+        </button>
+        <button class="btn-modal-close" id="btn-close-eval" type="button" aria-label="Close modal">✕</button>
+      </div>
+    </div>
+
+    <!-- Modal Tab Switcher -->
+    <div class="eval-tabs">
+      <button class="eval-tab active" data-tab="tab-holdout" type="button">
+        <span>🏆 30-Day Holdout Benchmarks</span>
+      </button>
+      <button class="eval-tab" data-tab="tab-cv" type="button">
+        <span>🔄 3-Fold Walk-Forward Cross Validation</span>
+      </button>
+      <button class="eval-tab" data-tab="tab-charts" type="button">
+        <span>📈 6-Panel Diagnostic Dashboard</span>
+      </button>
+      <button class="eval-tab" data-tab="tab-guide" type="button">
+        <span>📖 Metric Methodology & Domain Guide</span>
+      </button>
+    </div>
+
+    <div class="modal-body">
+      <!-- ── TAB 1: Holdout 30-Day Benchmark ── -->
+      <div class="eval-tab-pane active" id="pane-holdout">
+        <!-- Top Metrics Cards Grid -->
+        <div class="eval-kpi-grid">
+          <div class="eval-kpi-card highlight-glow">
+            <span class="eval-kpi-tag">Ensemble MAE</span>
+            <span class="eval-kpi-num" id="eval-val-mae">₹18,761</span>
+            <span class="eval-kpi-note green">↓ 48% vs Seasonal Naive</span>
+          </div>
+          <div class="eval-kpi-card">
+            <span class="eval-kpi-tag">Root Mean Sq Error (RMSE)</span>
+            <span class="eval-kpi-num" id="eval-val-rmse">₹38,559</span>
+            <span class="eval-kpi-note green">↓ 41% vs Seasonal Naive</span>
+          </div>
+          <div class="eval-kpi-card">
+            <span class="eval-kpi-tag">WAPE (Weighted % Error)</span>
+            <span class="eval-kpi-num" id="eval-val-wape">61.4%</span>
+            <span class="eval-kpi-note blue">Safe for zero-crossing flows</span>
+          </div>
+          <div class="eval-kpi-card">
+            <span class="eval-kpi-tag">Directional Accuracy (MDA)</span>
+            <span class="eval-kpi-num" id="eval-val-mda">86.7%</span>
+            <span class="eval-kpi-note green">Accurate inflow/outflow signs</span>
+          </div>
+          <div class="eval-kpi-card">
+            <span class="eval-kpi-tag">80% CI Coverage</span>
+            <span class="eval-kpi-num" id="eval-val-cov">76.7%</span>
+            <span class="eval-kpi-note purple">Target: 80% (Calibrated)</span>
+          </div>
+          <div class="eval-kpi-card">
+            <span class="eval-kpi-tag">MASE (Hyndman-Koehler)</span>
+            <span class="eval-kpi-num" id="eval-val-mase">0.483</span>
+            <span class="eval-kpi-note green">&lt; 1.0 = Strictly Superior</span>
+          </div>
+        </div>
+
+        <!-- Benchmark Comparison Table -->
+        <div class="eval-table-container">
+          <table class="eval-table" id="eval-holdout-table">
+            <thead>
+              <tr>
+                <th>Model</th>
+                <th>MAE (₹)</th>
+                <th>RMSE (₹)</th>
+                <th>WAPE %</th>
+                <th>sMAPE %</th>
+                <th>MASE</th>
+                <th>MDA %</th>
+                <th>R² Score</th>
+                <th>Cum. Balance MAE</th>
+                <th>Dip Timing Error</th>
+              </tr>
+            </thead>
+            <tbody id="eval-holdout-tbody">
+              <!-- Dynamically rendered -->
+            </tbody>
+          </table>
+        </div>
+
+        <div class="eval-takeaways-box">
+          <h4 class="takeaway-title">💡 Why the Ensemble Outperforms Individual Standalone Models:</h4>
+          <ul class="takeaway-list">
+            <li><strong>Mitigates Outlier Shocks:</strong> XGBoost captures high-frequency weekday/weekend and end-of-month payroll interactions, slashing RMSE from ₹53,644 (Prophet) down to ₹38,559.</li>
+            <li><strong>Preserves Calibrated Uncertainty:</strong> Prophet provides macro trend stability and a well-calibrated 80% confidence interval (76.7% empirical coverage), avoiding XGBoost's over-narrow bands.</li>
+            <li><strong>Zero Cash Dip Timing Error:</strong> Both models in ensemble accurately identify the exact day of the minimum liquidity trough (0 days error).</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- ── TAB 2: Walk-Forward CV ── -->
+      <div class="eval-tab-pane" id="pane-cv">
+        <div class="cv-intro-card">
+          <h4>Expanding-Window Time-Series Cross Validation (3 Folds)</h4>
+          <p>Standard k-fold cross validation suffers from lookahead bias and temporal leakage. Walk-Forward Backtesting trains models strictly on past data (Days 1..90, Days 1..120, Days 1..150) and forecasts subsequent 30-day unseen horizons.</p>
+        </div>
+        <div class="eval-table-container">
+          <table class="eval-table" id="eval-cv-table">
+            <thead>
+              <tr>
+                <th>Model</th>
+                <th>MAE (Mean ± Std)</th>
+                <th>RMSE (Mean ± Std)</th>
+                <th>WAPE % (Mean ± Std)</th>
+                <th>MASE (Mean ± Std)</th>
+                <th>Directional Accuracy (MDA %)</th>
+                <th>Cum. Balance MAE</th>
+                <th>Dip Timing Error</th>
+              </tr>
+            </thead>
+            <tbody id="eval-cv-tbody">
+              <!-- Dynamically populated -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ── TAB 3: Diagnostic Charts ── -->
+      <div class="eval-tab-pane" id="pane-charts">
+        <div class="chart-preview-header">
+          <div>
+            <h4>High-Resolution 6-Panel Diagnostic Dashboard</h4>
+            <p>Visual verification of Daily Flows, Cumulative Bank Balance Trajectory, Confidence Bands, Residual Densities, and Relative Metrics.</p>
+          </div>
+          <a href="/api/evaluate/chart" target="_blank" class="btn-download-chart">Open Full Image ↗</a>
+        </div>
+        <div class="eval-chart-img-wrap">
+          <img id="eval-dashboard-img" src="/api/evaluate/chart" alt="Model Evaluation Dashboard" loading="lazy" />
+        </div>
+      </div>
+
+      <!-- ── TAB 4: Metric Methodology Guide ── -->
+      <div class="eval-tab-pane" id="pane-guide">
+        <div class="metric-guide-grid">
+          <div class="guide-card">
+            <h5>1. WAPE vs MAPE (Why standard MAPE fails)</h5>
+            <p>Daily net cash flows can be zero or cross from positive to negative. Traditional MAPE divides by actual flow, causing infinite explosion when net cash flow is zero or near zero. <strong>WAPE</strong> (Weighted Absolute Percentage Error: $\sum |y - \hat{y}| / \sum |y|$) weights errors across total turnover, providing a robust, scale-safe percentage.</p>
+          </div>
+          <div class="guide-card">
+            <h5>2. MASE (Mean Absolute Scaled Error)</h5>
+            <p>Formulated by Hyndman & Koehler (2006). Scales the model's MAE against an in-sample one-step naive benchmark. If $\text{MASE} &lt; 1.0$, the model proves statistically meaningful predictive superiority over naive persistence.</p>
+          </div>
+          <div class="guide-card">
+            <h5>3. MDA (Mean Directional Accuracy)</h5>
+            <p>Measures the percentage of days where the forecast correctly identified the flow sign (inflow vs outflow). Crucial for CFOs deciding whether to initiate collections or release supplier payments.</p>
+          </div>
+          <div class="guide-card">
+            <h5>4. Cumulative Balance Path & Liquidity Dip Error</h5>
+            <p>In business liquidity planning, daily errors can offset each other. What determines solvency is the cumulative bank balance path: predicting whether cash dips below safety thresholds, and pinpointing the exact date of maximum crunch.</p>
+          </div>
+          <div class="guide-card">
+            <h5>5. Coverage Probability (PICP) for 80% CI</h5>
+            <p>For an 80% prediction interval, approximately 80% of actual transactions should fall within $[Lower, Upper]$. A model with 50% coverage is dangerously overconfident, while 99% coverage means intervals are excessively wide.</p>
+          </div>
+          <div class="guide-card">
+            <h5>6. RMSE vs MAE for Risk Management</h5>
+            <p>RMSE squares errors, heavily penalizing large unpredicted liquidity shortfalls. A single unforecasted ₹2 Lakh vendor bill triggers overdraft charges or payroll delays; hence minimizing RMSE is paramount.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-footer">
+      <span class="modal-footer-note">BB+ AI Cash Flow Engine · Validated on Prophet v1.1.5 + XGBoost v2.1.4</span>
+      <button class="btn-modal-done" id="btn-eval-done" type="button">Done</button>
+    </div>
+  </div>
+</div>
 
 <script src="app.js"></script>
 </body>

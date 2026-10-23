@@ -6,3 +6,5 @@ prophet
 numpy
 xgboost
 scikit-learn
+matplotlib
+lightgbm

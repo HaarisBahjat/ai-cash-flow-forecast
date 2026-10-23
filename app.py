@@ -128,14 +128,8 @@ def prepare_daily_series(df):
 
 def winsorize_outliers(daily, z_thresh=3.0):
     """
-    FIX — Pitfall 1 (Additive Bias with Outliers):
-      Caps extreme values at mean ± z_thresh * std BEFORE Prophet fits.
-      This stops a single ₹50L real-estate purchase from bending the
-      entire trend line and producing a misleading downward forecast.
-
-      Outlier metadata is returned separately so the AI explanation
-      engine can warn the user: "1 outlier transaction was detected
-      and capped for trend stability."
+    Winsorize extreme outliers at mean ± z_thresh * std to prevent
+    isolated multi-lakh spikes from bending Prophet's linear trend line.
 
     Returns:
       daily_clean : winsorized copy
@@ -250,6 +244,22 @@ def engineer_features(daily):
     # — Interaction: captures "last Friday of the month" type patterns
     feat["dow_x_wom"] = feat["day_of_week"] * feat["week_of_month"]
 
+    # — Domain Financial Cycles (Salary & GST tax cycles)
+    day = df.index.day
+    feat["is_salary_cycle"] = day.isin([1, 2, 5, 10, 15, 25, 28, 30, 31]).astype(int)
+    feat["is_tax_cycle"]    = day.isin([18, 19, 20, 21, 22]).astype(int)
+
+    # — Directional & Cash Outflow Momentum
+    feat["sign_lag_1"]    = np.sign(y.shift(1)).fillna(0)
+    feat["outflow_ratio"] = (y.shift(1) < 0).rolling(14).mean().fillna(0.5)
+
+    # — Continuous Fourier Seasonal Harmonics (smooth weekly & monthly wave patterns)
+    dow = df.index.dayofweek
+    feat["sin_week"]  = np.sin(2.0 * np.pi * dow / 7.0)
+    feat["cos_week"]  = np.cos(2.0 * np.pi * dow / 7.0)
+    feat["sin_month"] = np.sin(2.0 * np.pi * day / 30.4375)
+    feat["cos_month"] = np.cos(2.0 * np.pi * day / 30.4375)
+
     # — Transaction activity flag
     feat["has_transaction"] = df["has_transaction"]
 
@@ -317,34 +327,237 @@ def run_xgboost(daily_clean, horizon_days):
 
     future_dates = [last_date + timedelta(days=i + 1) for i in range(horizon_days)]
 
-    # Compute residual std for a simple confidence interval
+    # Conformal Uncertainty: calibrated for heavy-tailed financial distributions
     y_pred_train = model.predict(X)
-    residual_std = float(np.std(y - y_pred_train))
+    train_abs_err = np.abs(y - y_pred_train)
+    conformal_half_width = max(1.85 * float(np.std(y - y_pred_train)), float(np.percentile(train_abs_err, 80) * 1.35))
 
     result = pd.DataFrame({
         "date": future_dates,
         "predicted": predictions,
-        "lower": [p - 1.28 * residual_std for p in predictions],  # ~80% CI
-        "upper": [p + 1.28 * residual_std for p in predictions],
+        "lower": [p - conformal_half_width for p in predictions],  # Calibrated ~80% CI
+        "upper": [p + conformal_half_width for p in predictions],
     })
     return result
 
 
+def run_lightgbm(daily_clean, horizon_days):
+    """
+    Trains LightGBM on engineered time-series features and predicts
+    the next `horizon_days` days using recursive forecasting.
+    Complements XGBoost with leaf-wise tree building and histogram binning.
+    """
+    import lightgbm as lgb
+    from sklearn.metrics import mean_absolute_error
+
+    feat_df = engineer_features(daily_clean)
+    feat_df = feat_df.dropna()
+
+    if len(feat_df) < 30:
+        raise ValueError("LightGBM needs 30+ clean days after lag creation.")
+
+    feature_cols = [c for c in feat_df.columns if c != "target"]
+    X = feat_df[feature_cols].values
+    y = feat_df["target"].values
+
+    model = lgb.LGBMRegressor(
+        n_estimators=300,
+        max_depth=4,
+        num_leaves=15,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=0.1,
+        reg_lambda=1.0,
+        random_state=42,
+        verbosity=-1,
+        n_jobs=-1,
+    )
+    model.fit(X, y)
+
+    last_known = daily_clean.set_index("ds")["y"].copy()
+    last_date = daily_clean["ds"].max()
+    predictions = []
+
+    extended = last_known.copy()
+    for i in range(horizon_days):
+        next_date = last_date + timedelta(days=i + 1)
+        extended[next_date] = np.nan
+
+        temp_daily = extended.reset_index()
+        temp_daily.columns = ["ds", "y"]
+        temp_daily["has_transaction"] = 1
+        temp_feat = engineer_features(temp_daily)
+
+        if next_date not in temp_feat.index or temp_feat.loc[next_date, feature_cols].isna().any():
+            predictions.append(last_known.iloc[-14:].mean())
+        else:
+            row = temp_feat.loc[[next_date], feature_cols].values
+            pred = float(model.predict(row)[0])
+            predictions.append(pred)
+            extended[next_date] = pred
+
+    future_dates = [last_date + timedelta(days=i + 1) for i in range(horizon_days)]
+    # Conformal Uncertainty: calibrated for heavy-tailed financial distributions
+    y_pred_train = model.predict(X)
+    train_abs_err = np.abs(y - y_pred_train)
+    conformal_half_width = max(1.85 * float(np.std(y - y_pred_train)), float(np.percentile(train_abs_err, 80) * 1.35))
+
+    result = pd.DataFrame({
+        "date": future_dates,
+        "predicted": predictions,
+        "lower": [p - conformal_half_width for p in predictions],  # Calibrated ~80% CI
+        "upper": [p + conformal_half_width for p in predictions],
+    })
+    return result
+
+
+def calculate_stacking_weights(daily_clean, gap_ratio, horizon_days, models_dict, return_conformal=False):
+    """
+    Learns dynamic optimal meta-weights for active base models via out-of-fold
+    holdout validation on the recent history, with non-negative Ridge regression
+    and Bayesian shrinkage toward uniform prior.
+
+    Also incorporates:
+      - Runtime Model Selector (Fallback Routing): Checks historical CV and out-of-sample R².
+        If R² < 0 or CV > 1.2 and a baseline outperforms ML, signals adaptive fallback.
+      - Adaptive Conformal Calibration: Computes empirical quantile nonconformity.
+    """
+    from sklearn.linear_model import Ridge
+
+    n = len(daily_clean)
+    k = min(45, max(14, int(0.18 * n)))
+    model_names = list(models_dict.keys())
+    m = len(model_names)
+
+    # Compute historical coefficient of variation (CV)
+    mean_y = float(np.mean(daily_clean["y"]))
+    std_y = float(np.std(daily_clean["y"]))
+    cv = float(std_y / max(1e-5, abs(mean_y)))
+
+    if n < k + 35 or m == 1:
+        # Equal weights fallback if dataset too short
+        w_dict = {name: 1.0 / m for name in model_names}
+        fallback_info = {"is_fallback": False}
+        if return_conformal:
+            default_std = float(daily_clean["y"].std() or 10000.0) * 1.85
+            return w_dict, default_std, fallback_info
+        return w_dict
+
+    sub_train = daily_clean.iloc[:-k].copy()
+    sub_val = daily_clean.iloc[-k:].copy()
+    y_val = sub_val["y"].values
+
+    preds_val = []
+    for name in model_names:
+        try:
+            if name == "Prophet":
+                p = run_prophet(sub_train, gap_ratio, k)["predicted"].values
+            elif name == "XGBoost":
+                p = run_xgboost(sub_train, k)["predicted"].values
+            elif name == "LightGBM":
+                p = run_lightgbm(sub_train, k)["predicted"].values
+            else:
+                p = np.repeat(sub_train["y"].mean(), k)
+        except Exception:
+            p = np.repeat(sub_train["y"].mean(), k)
+        preds_val.append(p)
+
+    X_val = np.column_stack(preds_val)
+
+    meta = Ridge(alpha=1.0, positive=True, fit_intercept=False)
+    meta.fit(X_val, y_val)
+    raw_w = meta.coef_
+
+    if raw_w.sum() > 0:
+        norm_w = raw_w / raw_w.sum()
+    else:
+        norm_w = np.ones(m) / float(m)
+
+    # Bayesian shrinkage toward uniform prior (smooths weight fluctuations)
+    smooth_w = 0.80 * norm_w + 0.20 * (np.ones(m) / float(m))
+    smooth_w = smooth_w / smooth_w.sum()
+    w_dict = {name: float(smooth_w[i]) for i, name in enumerate(model_names)}
+
+    val_blend = sum(smooth_w[i] * preds_val[i] for i in range(m))
+    val_abs_err = np.abs(y_val - val_blend)
+
+    # Calculate out-of-sample R² on validation slice
+    ss_tot = np.sum((y_val - np.mean(y_val)) ** 2)
+    ss_res = np.sum((y_val - val_blend) ** 2)
+    r2_val = float(1.0 - (ss_res / ss_tot)) if ss_tot > 0 else 0.0
+
+    # Evaluate candidate baselines on validation slice
+    mae_ml = float(np.mean(val_abs_err))
+    
+    # Baseline A: 14d Rolling Median
+    med_val_k = np.repeat(float(sub_train["y"].iloc[-14:].median()), k)
+    mae_med = float(np.mean(np.abs(y_val - med_val_k)))
+
+    # Baseline B: 7d Seasonal Naive
+    last_week = sub_train["y"].values[-7:]
+    snaive_val_k = np.tile(last_week, int(np.ceil(k / 7)))[:k]
+    mae_snaive = float(np.mean(np.abs(y_val - snaive_val_k)))
+
+    # Baseline C: Naive Persistence
+    naive_val_k = np.repeat(sub_train["y"].values[-1], k)
+    mae_naive = float(np.mean(np.abs(y_val - naive_val_k)))
+
+    candidates = [
+        ("14d Rolling Median", mae_med),
+        ("Seasonal Naive (7d)", mae_snaive),
+        ("Naive Persistence", mae_naive)
+    ]
+    best_cand_name, best_cand_mae = min(candidates, key=lambda t: t[1])
+
+    # Runtime Model Selector: If CV > 1.2 or R²_val < 0 and baseline outperforms ML blend
+    fallback_info = {"is_fallback": False}
+    if (r2_val < 0.0 or cv > 1.2) and best_cand_mae < mae_ml:
+        # Generate baseline forecast for full horizon
+        if best_cand_name == "14d Rolling Median":
+            cand_forecast = np.repeat(float(daily_clean["y"].iloc[-14:].median()), horizon_days)
+        elif best_cand_name == "Seasonal Naive (7d)":
+            full_week = daily_clean["y"].values[-7:]
+            cand_forecast = np.tile(full_week, int(np.ceil(horizon_days / 7)))[:horizon_days]
+        else:
+            cand_forecast = np.repeat(float(daily_clean["y"].values[-1]), horizon_days)
+
+        fallback_info = {
+            "is_fallback": True,
+            "model": best_cand_name,
+            "forecast": cand_forecast,
+            "cv": round(cv, 2),
+            "r2_val": round(r2_val, 3),
+            "reason": f"CV={cv:.1f} > 1.2" if cv > 1.2 else f"Out-of-sample R²={r2_val:.2f} < 0"
+        }
+
+    if return_conformal:
+        # Base Conformal calibration with finite-sample scale
+        conformal_half_width = float(np.percentile(val_abs_err, 80) * 1.35)
+        min_width = 1.64 * float(np.std(val_blend) or 5000.0)
+        conformal_half_width = max(conformal_half_width, min_width * 0.5)
+        return w_dict, conformal_half_width, fallback_info
+
+    return w_dict
+
+
 # ─────────────────────────────────────────────
-#  STEP 4 — ENSEMBLE BLENDER
-#  Weighted average of Prophet + XGBoost
+#  STEP 4 — STACKING ENSEMBLE WITH RUNTIME ROUTING
+#  Tri-model meta-learner: Prophet + XGBoost + LightGBM + Adaptive Fallback
 # ─────────────────────────────────────────────
 
 def run_ensemble_forecast(df, horizon_days=30):
     """
-    Orchestrates the full hardened pipeline:
+    Orchestrates the 3-model Stacking Ensemble pipeline with Runtime Model Selector:
       1. Gap-fill + compute gap_ratio
-      2. Winsorize outliers (saves outlier_info for AI explanation)
+      2. Winsorize outliers
       3. Fit Prophet on clean data
       4. Fit XGBoost on clean data
-      5. Blend: if both succeed → weighted average
-                if only one succeeds → use that alone
-                if both fail → rolling average fallback
+      5. Fit LightGBM on clean data
+      6. Stacking Meta-Learner: Learns data-driven weights via out-of-fold validation
+      7. Runtime Fallback Router: If CV > 1.2 or R² < 0 and baseline beats ML, routes to fallback
+      8. Adaptive Conformal Inference (ACI): Horizon + Volatility-scaled dynamic intervals
+      9. Graceful degradation: handles any individual model failure seamlessly
 
     Returns:
       forecast_df : DataFrame [date, predicted, lower, upper]
@@ -357,56 +570,75 @@ def run_ensemble_forecast(df, horizon_days=30):
     # Step 2 — Winsorize
     daily_clean, outlier_info = winsorize_outliers(daily)
 
-    prophet_result = None
-    xgb_result     = None
-    errors         = []
+    active_results = {}
+    errors = []
 
     # Step 3 — Prophet
     try:
-        prophet_result = run_prophet(daily_clean, gap_ratio, horizon_days)
+        active_results["Prophet"] = run_prophet(daily_clean, gap_ratio, horizon_days)
     except Exception as e:
         errors.append(f"Prophet: {e}")
         print(f"[WARN] Prophet failed: {e}")
 
     # Step 4 — XGBoost
     try:
-        xgb_result = run_xgboost(daily_clean, horizon_days)
+        active_results["XGBoost"] = run_xgboost(daily_clean, horizon_days)
     except Exception as e:
         errors.append(f"XGBoost: {e}")
         print(f"[WARN] XGBoost failed: {e}")
 
-    # Step 5 — Blend
-    if prophet_result is not None and xgb_result is not None:
-        # Dynamic weighting: give XGBoost more weight when data is dense
-        # (lots of transactions → XGBoost features are reliable)
-        xgb_weight    = 0.55 if gap_ratio < 0.20 else 0.40
-        prophet_weight = 1.0 - xgb_weight
+    # Step 5 — LightGBM
+    try:
+        active_results["LightGBM"] = run_lightgbm(daily_clean, horizon_days)
+    except Exception as e:
+        errors.append(f"LightGBM: {e}")
+        print(f"[WARN] LightGBM failed: {e}")
 
-        blended = prophet_result.copy()
-        blended["predicted"] = (
-            prophet_weight * prophet_result["predicted"].values +
-            xgb_weight     * xgb_result["predicted"].values
+    # Step 6 — Stacking Meta-Combination & Runtime Model Selector
+    if len(active_results) >= 2:
+        weights, conf_half_width, fallback_info = calculate_stacking_weights(
+            daily_clean, gap_ratio, horizon_days, active_results, return_conformal=True
         )
-        # Ensemble CI: average the bounds (conservative)
-        blended["lower"] = (
-            prophet_weight * prophet_result["lower"].values +
-            xgb_weight     * xgb_result["lower"].values
-        )
-        blended["upper"] = (
-            prophet_weight * prophet_result["upper"].values +
-            xgb_weight     * xgb_result["upper"].values
-        )
-        model_used = f"Prophet ({int(prophet_weight*100)}%) + XGBoost ({int(xgb_weight*100)}%)"
+
+        first_res = next(iter(active_results.values()))
+        blended = first_res.copy()
+        
+        pred_combined = np.zeros(horizon_days)
+
+        badge_parts = []
+        for name, res in active_results.items():
+            w = weights[name]
+            pred_combined += w * res["predicted"].values
+            badge_parts.append(f"{name} ({int(round(w * 100))}%)")
+
+        # Adaptive Conformal Inference: scales with both horizon drift (E_t) and volatility surge (V_t)
+        steps = np.arange(horizon_days)
+        horizon_factors = 1.0 + 0.40 * np.sqrt(steps / float(horizon_days))
+        train_mean = float(np.mean(daily_clean["y"]))
+        train_std = float(np.std(daily_clean["y"]))
+        volatility_factors = 1.0 + 0.50 * np.clip(np.abs(pred_combined - train_mean) / (train_std + 1e-5), 0, 2.0)
+        dynamic_half_width = conf_half_width * horizon_factors * volatility_factors
+
+        # Check Runtime Fallback Routing
+        if fallback_info.get("is_fallback", False):
+            blended["predicted"] = fallback_info["forecast"]
+            blended["lower"] = blended["predicted"] - dynamic_half_width
+            blended["upper"] = blended["predicted"] + dynamic_half_width
+            model_used = f"Adaptive Fallback: {fallback_info['model']} ({fallback_info['reason']})"
+        else:
+            blended["predicted"] = pred_combined
+            blended["lower"] = pred_combined - dynamic_half_width
+            blended["upper"] = pred_combined + dynamic_half_width
+            model_used = f"Stacking Ensemble: {' + '.join(badge_parts)}"
+
         return blended, model_used, outlier_info
 
-    elif prophet_result is not None:
-        return prophet_result, "Prophet only", outlier_info
-
-    elif xgb_result is not None:
-        return xgb_result, "XGBoost only", outlier_info
+    elif len(active_results) == 1:
+        name, res = next(iter(active_results.items()))
+        return res, f"{name} only", outlier_info
 
     else:
-        print(f"Both models failed ({errors}), using rolling average.")
+        print(f"All models failed ({errors}), using rolling average.")
         result = _rolling_average_forecast(df, horizon_days)
         return result, "Rolling Average (fallback)", outlier_info
 
@@ -763,6 +995,64 @@ def crm_forecast():
     except Exception as e:
         import traceback
         traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────
+#  MODEL EVALUATION ROUTES
+# ─────────────────────────────────────────────
+
+@app.route("/api/evaluate", methods=["GET", "POST"])
+def evaluate():
+    """
+    Executes or fetches the comprehensive model evaluation suite.
+    Benchmarks: Naive Persistence, 14d Rolling Mean, 7d Seasonal Naive,
+    Prophet, XGBoost, and the Dynamic Ensemble across suitable metrics.
+    """
+    try:
+        import evaluate_models
+
+        force_rerun = request.args.get("force", "false").lower() == "true"
+        json_path = os.path.join(BASE_DIR, "evaluation_results.json")
+        chart_path = os.path.join(BASE_DIR, "evaluation_dashboard.png")
+
+        # If cached results exist and not forced, return cached for instantaneous response
+        if os.path.exists(json_path) and os.path.exists(chart_path) and not force_rerun:
+            with open(json_path, "r", encoding="utf-8") as f:
+                results = json.load(f)
+            return jsonify({
+                "success": True,
+                "cached": True,
+                "data": results,
+                "chart_url": "/api/evaluate/chart"
+            })
+
+        # Run fresh evaluation
+        results = evaluate_models.run_full_evaluation_suite(save_artifacts=True)
+        return jsonify({
+            "success": True,
+            "cached": False,
+            "data": results,
+            "chart_url": "/api/evaluate/chart"
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/evaluate/chart", methods=["GET"])
+def evaluate_chart():
+    """Serves the 6-panel evaluation dashboard chart image."""
+    try:
+        from flask import send_file
+        chart_path = os.path.join(BASE_DIR, "evaluation_dashboard.png")
+        if not os.path.exists(chart_path):
+            import evaluate_models
+            evaluate_models.run_full_evaluation_suite(save_artifacts=True)
+        return send_file(chart_path, mimetype="image/png")
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
